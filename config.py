@@ -2,11 +2,11 @@
 import os
 
 class Config:
-    DATA_DIR = "/home/redili/TR_project/code_2_4/data" 
+    DATA_DIR = "./code_2_4/data" 
     TRAIN_CSV = os.path.join(DATA_DIR, "train.csv")
     VAL_CSV = os.path.join(DATA_DIR, "val.csv")
     TEST_CSV = os.path.join(DATA_DIR, "test_external.xlsx")
-    SAVE_DIR = "/home/redili/TR_project/code_2_4/code_2class/save_ECHO-RADIL"
+    SAVE_DIR = "./code_2_4/code_2class/save_ECHO-RADIL"
     
     IMG_SIZE = 224
     NUM_FRAMES = 32  

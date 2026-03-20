@@ -15,11 +15,11 @@ from model_mobile import Echo_RADIL
 from config import Config
 from torch.utils.data import DataLoader
 
-CKPT_PATH = "/home/redili/TR_project/code_2_4/code_2class/save_ECHO-RADIL_no3/checkpoints/ECHO-RADIL_v1/epoch=31-f1_val_f1_weighted=0.7002.ckpt"
-TEST_XLSX = "/home/redili/TR_project/code_2_4/data_no3/test_external.csv"
-TEST_DATA_DIR = "/hdd/ScholarSupport/1-ZhongshanHeart/Basic/data_2_4_new/center_xiamen"
+CKPT_PATH = "./save_ECHO-RADIL_no3/checkpoints/ECHO-RADIL_v1/epoch=31-f1_val_f1_weighted=0.7002.ckpt"
+TEST_XLSX = "./data_no3/test_external.csv"
+TEST_DATA_DIR = "./data_2_4_new/center_xiamen"
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-SAVE_DIR = "/home/redili/TR_project/code_2_4/code_2class/test_results_echoradil_no3_v1"
+SAVE_DIR = "./test_results_echoradil_no3_v1"
 
 ENABLE_TTA = True
 TTA_ROUNDS = 5
