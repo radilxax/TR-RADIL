@@ -7,38 +7,25 @@ A4C echocardiographic video and minimal clinical variables.
 Usage:
     python inference.py \
         --video_path data/patient_001.nii.gz \
-        --age 65 \
-        --sex female \
-        --baseline_tr_grade 2 \
+        --age 65 --sex female --baseline_tr_grade 2 \
         --prediction_horizon_days 365 \
         --checkpoint_path weights/best_model.ckpt
 
-    # Disable test-time augmentation for faster inference:
-    python inference.py \
-        --video_path data/patient_001.nii.gz \
-        --age 65 --sex female --baseline_tr_grade 1 \
-        --prediction_horizon_days 730 \
-        --checkpoint_path weights/best_model.ckpt \
-        --no_tta
-
 Inputs:
-    - video_path           : A4C echocardiographic video in NIfTI (.nii.gz) format
-    - age                  : Patient age in years
-    - sex                  : male or female
-    - baseline_tr_grade    : 1 (mild) or 2 (moderate)
+    - video_path              : A4C echocardiographic video (.nii.gz)
+    - age                     : Patient age in years
+    - sex                     : male or female
+    - baseline_tr_grade       : 1 (mild) or 2 (moderate)
     - prediction_horizon_days : Target prediction window in days
-                               (e.g., 365 for 1-year, 1095 for 3-year)
-    - checkpoint_path      : Path to trained model checkpoint (.ckpt)
+    - checkpoint_path         : Path to trained model checkpoint (.ckpt)
 
 Outputs:
-    - Predicted probability of TR progression (0–1)
+    - Predicted probability of TR progression (0-1)
     - Binary prediction (Worsen / Stable+Improved)
-    - Predicted follow-up TR severity grade (auxiliary: 1=mild, 2=moderate, 3=severe)
-    - Spatial attention map and temporal attention weights (optional, saved as .npy)
+    - Predicted follow-up TR severity grade (1=mild, 2=moderate, 3=severe)
 """
 
 import argparse
-import json
 import os
 import sys
 from typing import Any, cast
@@ -56,7 +43,7 @@ from config import Config
 
 
 # ---------------------------------------------------------------------------
-# Video loading & preprocessing  (mirrors dataset.py __getitem__ for mode='val')
+# Video loading & preprocessing (mirrors dataset.py for val/test mode)
 # ---------------------------------------------------------------------------
 
 def load_video(video_path: str) -> np.ndarray:
@@ -84,7 +71,7 @@ def load_video(video_path: str) -> np.ndarray:
 
     v = np.ascontiguousarray(v)
 
-    # Temporal sampling: center crop to NUM_FRAMES (same as val/test mode)
+    # Temporal sampling: center crop to NUM_FRAMES
     T_raw = v.shape[0]
     if T_raw >= Config.NUM_FRAMES:
         start = (T_raw - Config.NUM_FRAMES) // 2
@@ -99,17 +86,9 @@ def load_video(video_path: str) -> np.ndarray:
 
 def preprocess_frames(video_raw: np.ndarray, is_external: bool = False) -> torch.Tensor:
     """
-    Apply per-frame spatial preprocessing identical to dataset.py (val/test mode).
+    Per-frame spatial preprocessing identical to dataset.py (val/test mode).
 
-    Parameters
-    ----------
-    video_raw : (T, H, W) float32 array from load_video()
-    is_external : If True, apply orientation correction (rot90 + flip)
-                  used for the external center data.
-
-    Returns
-    -------
-    video_tensor : (3, T, H, W) float32 tensor, ImageNet-normalised.
+    Returns: (3, T, H, W) float32 tensor, ImageNet-normalised.
     """
     normalize = A.Normalize(
         mean=(0.485, 0.456, 0.406),
@@ -145,10 +124,10 @@ def preprocess_frames(video_raw: np.ndarray, is_external: bool = False) -> torch
             fr = fr[h_center - h_crop: h_center + h_crop,
                      w_center - w_crop: w_center + w_crop]
 
-        # 2. Resize to 224×224
+        # 2. Resize to 224x224
         fr = cv2.resize(fr, (Config.IMG_SIZE, Config.IMG_SIZE))
 
-        # 3. Min-max → uint8
+        # 3. Min-max -> uint8
         if fr.dtype != np.uint8:
             if global_max > global_min:
                 fr = 255.0 * (fr - global_min) / (global_max - global_min)
@@ -156,7 +135,7 @@ def preprocess_frames(video_raw: np.ndarray, is_external: bool = False) -> torch
                 fr = np.zeros_like(fr)
             fr = fr.astype(np.uint8)
 
-        # 4. Gray → RGB
+        # 4. Gray -> RGB
         fr = cv2.cvtColor(fr, cv2.COLOR_GRAY2RGB)
 
         # 5. Edge masking
@@ -173,7 +152,6 @@ def preprocess_frames(video_raw: np.ndarray, is_external: bool = False) -> torch
         frame_aug = aug(image=fr)['image']
         frames.append(frame_aug)
 
-    # (T, 3, H, W) -> (3, T, H, W)
     video_t = torch.stack(frames).permute(1, 0, 2, 3)
     return video_t
 
@@ -186,29 +164,25 @@ def encode_clinical(
 ) -> torch.Tensor:
     """
     Encode clinical variables into a 4-d tensor matching training format.
-
-    Encoding:
-        [0] baseline_tr_severity  : (grade - 1) / 2   → mild=0.0, moderate=0.5
-        [1] age                   : age / 100
-        [2] sex                   : female=1.0, male=0.0
-        [3] follow_up_interval    : days / 3650
+        [0] baseline_tr_severity : (grade - 1) / 2
+        [1] age                  : age / 100
+        [2] sex                  : female=1.0, male=0.0
+        [3] follow_up_interval   : days / 3650
     """
     first_val = (baseline_tr_grade - 1.0) / (Config.NUM_SEVERITY_LEVELS - 1.0)
     age_norm = age / 100.0
-    gender = 1.0 if sex.lower() in ('female', 'f', '女') else 0.0
+    gender = 1.0 if sex.lower() in ('female', 'f') else 0.0
     interval = prediction_horizon_days / 3650.0
-
     return torch.tensor([first_val, age_norm, gender, interval], dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
-# TTA (test-time augmentation)  — mirrors test.py
+# TTA (test-time augmentation) — mirrors test.py
 # ---------------------------------------------------------------------------
 
 def apply_tta(video: torch.Tensor, tta_idx: int) -> torch.Tensor:
-    """Apply the tta_idx-th augmentation to a (1, 3, T, H, W) tensor."""
     if tta_idx == 0:
-        return video                              # original
+        return video
     elif tta_idx == 1:
         return torch.flip(video, dims=[-1])       # horizontal flip
     elif tta_idx == 2:
@@ -234,51 +208,35 @@ def predict_single_patient(
     is_external: bool = False,
     enable_tta: bool = True,
     tta_rounds: int = 5,
-    save_attention: bool = False,
-    output_dir: str = "./inference_output",
 ):
-    """
-    Run TR-RADIL inference for a single patient.
-
-    Returns
-    -------
-    dict with keys:
-        progression_probability, prediction, predicted_followup_grade,
-        prediction_horizon_days, confidence
-    """
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # ---- Load model ----
+    # Load model
     model = Echo_RADIL.load_from_checkpoint(checkpoint_path, map_location=device)
     model.to(device)
     model.eval()
 
-    # ---- Preprocess video ----
+    # Preprocess video
     video_raw = load_video(video_path)
     video_tensor = preprocess_frames(video_raw, is_external=is_external)
     video_tensor = video_tensor.unsqueeze(0).to(device)  # (1, 3, T, H, W)
 
-    # ---- Encode clinical variables ----
+    # Encode clinical variables
     clinical_tensor = encode_clinical(
         age, sex, baseline_tr_grade, prediction_horizon_days
-    ).unsqueeze(0).to(device)  # (1, 4)
+    ).unsqueeze(0).to(device)
 
-    # ---- Inference (with optional TTA) ----
+    # Inference with optional TTA
     rounds = tta_rounds if enable_tta else 1
     accumulated_probs = None
-    spatial_attn_map = None
-    temporal_attn_weights = None
 
     for tta_idx in range(rounds):
         v_input = apply_tta(video_tensor, tta_idx)
-        logits, aux_logits, attn_map, t_attn_w = model(v_input, clinical_tensor)
+        logits, aux_logits, _, _ = model(v_input, clinical_tensor)
         probs = F.softmax(logits, dim=1).cpu().numpy()
 
         if accumulated_probs is None:
             accumulated_probs = probs
-            # Save attention from the original (non-augmented) pass
-            spatial_attn_map = attn_map.cpu().numpy()
-            temporal_attn_weights = t_attn_w.cpu().numpy()
         else:
             accumulated_probs += probs
 
@@ -286,17 +244,14 @@ def predict_single_patient(
     prob_worsen = float(final_probs[0, 1])
     pred_class = int(np.argmax(final_probs[0]))
 
-    # Auxiliary output: predicted follow-up TR severity grade
-    # (use the non-augmented aux_logits from tta_idx=0; already computed above)
-    # Re-run once without TTA for clean aux prediction
+    # Auxiliary: predicted follow-up TR severity (from non-augmented pass)
     logits_clean, aux_logits_clean, _, _ = model(video_tensor, clinical_tensor)
-    aux_pred = int(torch.argmax(aux_logits_clean, dim=1).item()) + 1  # 0-indexed → 1-indexed
+    aux_pred = int(torch.argmax(aux_logits_clean, dim=1).item()) + 1
 
-    # ---- Construct result ----
     label_map = {0: "Stable/Improved", 1: "Worsen"}
     grade_map = {1: "Mild", 2: "Moderate", 3: "Severe"}
 
-    result = {
+    return {
         "video_path": os.path.basename(video_path),
         "patient_info": {
             "age": age,
@@ -314,49 +269,26 @@ def predict_single_patient(
         "device": str(device),
     }
 
-    # ---- Optionally save attention maps ----
-    if save_attention:
-        os.makedirs(output_dir, exist_ok=True)
-        base_name = os.path.splitext(os.path.basename(video_path))[0].replace(".nii", "")
-
-        spatial_path = os.path.join(output_dir, f"{base_name}_spatial_attn.npy")
-        temporal_path = os.path.join(output_dir, f"{base_name}_temporal_attn.npy")
-        np.save(spatial_path, spatial_attn_map)
-        np.save(temporal_path, temporal_attn_weights)
-        result["spatial_attention_path"] = spatial_path
-        result["temporal_attention_path"] = temporal_path
-
-        # Save result JSON
-        json_path = os.path.join(output_dir, f"{base_name}_result.json")
-        with open(json_path, "w") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        result["result_json_path"] = json_path
-
-    return result
-
 
 def print_result(result: dict):
-    """Pretty-print the inference result."""
     print("\n" + "=" * 60)
     print("  TR-RADIL Inference Result")
     print("=" * 60)
-    print(f"  Video           : {result['video_path']}")
-    print(f"  Age             : {result['patient_info']['age']}")
-    print(f"  Sex             : {result['patient_info']['sex']}")
-    print(f"  Baseline TR     : Grade {result['patient_info']['baseline_tr_grade']} "
+    print(f"  Video              : {result['video_path']}")
+    print(f"  Age                : {result['patient_info']['age']}")
+    print(f"  Sex                : {result['patient_info']['sex']}")
+    print(f"  Baseline TR        : Grade {result['patient_info']['baseline_tr_grade']} "
           f"({result['patient_info']['baseline_tr_severity']})")
     print(f"  Prediction Horizon : {result['prediction_horizon_days']} days "
           f"({result['prediction_horizon_days'] / 365:.1f} years)")
     print("-" * 60)
-    print(f"  ★ Progression Probability : {result['progression_probability']:.1%}")
-    print(f"  ★ Prediction              : {result['prediction']}")
-    print(f"  ★ Predicted Follow-up TR  : Grade {result['predicted_followup_grade']} "
+    print(f"  Progression Prob   : {result['progression_probability']:.1%}")
+    print(f"  Prediction         : {result['prediction']}")
+    print(f"  Follow-up TR Grade : {result['predicted_followup_grade']} "
           f"({result['predicted_followup_severity']})")
     print("-" * 60)
-    print(f"  TTA             : {'ON ×' + str(result['tta_rounds']) if result['tta_enabled'] else 'OFF'}")
-    print(f"  Device          : {result['device']}")
-    if "result_json_path" in result:
-        print(f"  Results saved   : {result['result_json_path']}")
+    print(f"  TTA                : {'ON x' + str(result['tta_rounds']) if result['tta_enabled'] else 'OFF'}")
+    print(f"  Device             : {result['device']}")
     print("=" * 60 + "\n")
 
 
@@ -366,24 +298,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # 1-year risk prediction for a 65-year-old female with moderate TR
-  python inference.py \\
-      --video_path data/patient_001.nii.gz \\
-      --age 65 --sex female --baseline_tr_grade 2 \\
-      --prediction_horizon_days 365 \\
+  # 1-year risk prediction
+  python inference.py --video_path patient.nii.gz --age 65 --sex female \\
+      --baseline_tr_grade 2 --prediction_horizon_days 365 \\
       --checkpoint_path weights/best_model.ckpt
 
-  # 3-year risk prediction, no TTA, save attention maps
-  python inference.py \\
-      --video_path data/patient_002.nii.gz \\
-      --age 72 --sex male --baseline_tr_grade 1 \\
-      --prediction_horizon_days 1095 \\
-      --checkpoint_path weights/best_model.ckpt \\
-      --no_tta --save_attention --output_dir results/
+  # 3-year risk, no TTA (faster)
+  python inference.py --video_path patient.nii.gz --age 72 --sex male \\
+      --baseline_tr_grade 1 --prediction_horizon_days 1095 \\
+      --checkpoint_path weights/best_model.ckpt --no_tta
         """,
     )
 
-    # Required arguments
     parser.add_argument("--video_path", type=str, required=True,
                         help="Path to A4C echocardiographic video (.nii.gz)")
     parser.add_argument("--age", type=float, required=True,
@@ -391,41 +317,25 @@ Examples:
     parser.add_argument("--sex", type=str, required=True, choices=["male", "female"],
                         help="Patient sex")
     parser.add_argument("--baseline_tr_grade", type=int, required=True, choices=[1, 2],
-                        help="Baseline TR severity grade: 1 (mild) or 2 (moderate)")
+                        help="Baseline TR severity: 1 (mild) or 2 (moderate)")
     parser.add_argument("--prediction_horizon_days", type=int, required=True,
                         help="Target prediction window in days (e.g., 365, 730, 1095)")
     parser.add_argument("--checkpoint_path", type=str, required=True,
                         help="Path to trained model checkpoint (.ckpt)")
-
-    # Optional arguments
     parser.add_argument("--is_external", action="store_true", default=False,
-                        help="Apply orientation correction for external-center data "
-                             "(rot90 + vertical flip)")
+                        help="Apply orientation correction for external-center data")
     parser.add_argument("--no_tta", action="store_true", default=False,
-                        help="Disable test-time augmentation (faster, slightly less robust)")
+                        help="Disable test-time augmentation")
     parser.add_argument("--tta_rounds", type=int, default=5,
                         help="Number of TTA rounds (default: 5)")
-    parser.add_argument("--save_attention", action="store_true", default=False,
-                        help="Save spatial and temporal attention maps as .npy files")
-    parser.add_argument("--output_dir", type=str, default="./inference_output",
-                        help="Directory to save attention maps and result JSON")
 
     args = parser.parse_args()
 
-    # Validate inputs
     if not os.path.isfile(args.video_path):
-        print(f"Error: Video file not found: {args.video_path}")
-        sys.exit(1)
+        print(f"Error: Video file not found: {args.video_path}"); sys.exit(1)
     if not os.path.isfile(args.checkpoint_path):
-        print(f"Error: Checkpoint not found: {args.checkpoint_path}")
-        sys.exit(1)
-    if args.age <= 0 or args.age > 120:
-        print(f"Warning: Unusual age value ({args.age}). Proceeding anyway.")
-    if args.prediction_horizon_days <= 0:
-        print("Error: prediction_horizon_days must be positive.")
-        sys.exit(1)
+        print(f"Error: Checkpoint not found: {args.checkpoint_path}"); sys.exit(1)
 
-    # Run inference
     result = predict_single_patient(
         video_path=args.video_path,
         age=args.age,
@@ -436,8 +346,6 @@ Examples:
         is_external=args.is_external,
         enable_tta=not args.no_tta,
         tta_rounds=args.tta_rounds,
-        save_attention=args.save_attention,
-        output_dir=args.output_dir,
     )
 
     print_result(result)
