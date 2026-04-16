@@ -205,3 +205,28 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ===== TR-RADIL specific =====
+# Model checkpoints (use GitHub Releases instead)
+*.ckpt
+weights/
+
+# Data files
+data/
+*.csv
+*.xlsx
+*.xls
+*.nii
+*.nii.gz
+
+# Training outputs
+save_ECHO-RADIL/
+test_results*/
+inference_output/
+lightning_logs/
+
+# Large files
+*.tar.gz
+*.zip
+*.h5
+*.hdf5
