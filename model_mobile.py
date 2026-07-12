@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import torchvision.models as models
 import pytorch_lightning as pl
+from typing import Optional, Dict, Any
 from torchmetrics import MetricCollection
 from torchmetrics.classification import (
     MulticlassAccuracy, MulticlassF1Score, MulticlassAUROC,
@@ -143,6 +144,86 @@ class Echo_RADIL(pl.LightningModule):
         self.train_metrics = metrics.clone(prefix='train_')
         self.val_metrics = metrics.clone(prefix='val_')
         self.val_cm = MulticlassConfusionMatrix(num_classes=Config.NUM_CLASSES)
+
+    def _gradcam_target_layer(self):
+        # Use the last convolutional block of the MobileNet feature extractor.
+        return self.feature_extractor[-1]
+
+    @torch.enable_grad()
+    def generate_gradcam(
+        self,
+        video: torch.Tensor,
+        clinical: torch.Tensor,
+        target_class: Optional[torch.Tensor] = None,
+        target_layer: Optional[nn.Module] = None,
+    ) -> Dict[str, Any]:
+        """Generate per-frame Grad-CAM maps for a video batch.
+
+        Returns:
+            dict with:
+                gradcam: (B, T, H, W) normalized heatmaps in [0, 1]
+                logits: main-task logits
+                aux_logits: auxiliary logits
+                pred_class: class index used for Grad-CAM
+        """
+        was_training = self.training
+        self.eval()
+
+        b, c, t, h, w = video.shape
+        layer = target_layer if target_layer is not None else self._gradcam_target_layer()
+
+        cache: Dict[str, torch.Tensor] = {}
+
+        def forward_hook(_module, _inputs, output):
+            cache['activations'] = output
+
+            def save_grad(grad):
+                cache['gradients'] = grad
+
+            output.register_hook(save_grad)
+
+        handle = layer.register_forward_hook(forward_hook)
+
+        try:
+            self.zero_grad(set_to_none=True)
+            logits, aux_logits, _, _ = self(video, clinical)
+
+            if target_class is None:
+                pred_class = torch.argmax(logits, dim=1)
+            elif isinstance(target_class, torch.Tensor):
+                pred_class = target_class.to(logits.device).long().view(-1)
+            else:
+                pred_class = torch.full(
+                    (logits.size(0),), int(target_class),
+                    device=logits.device, dtype=torch.long,
+                )
+
+            selected = logits.gather(1, pred_class.view(-1, 1)).sum()
+            selected.backward()
+
+            activations = cache['activations']          # (B*T, C, h, w)
+            gradients = cache['gradients']              # (B*T, C, h, w)
+
+            weights = gradients.mean(dim=(2, 3), keepdim=True)
+            cam = F.relu((weights * activations).sum(dim=1, keepdim=True))
+
+            cam = F.interpolate(cam, size=(h, w), mode='bilinear', align_corners=False)
+            cam = cam.view(b * t, 1, h, w)
+            cam = cam - cam.amin(dim=(2, 3), keepdim=True)
+            cam = cam / (cam.amax(dim=(2, 3), keepdim=True) + 1e-6)
+            cam = cam.view(b, t, h, w)
+
+            return {
+                'gradcam': cam.detach(),
+                'logits': logits.detach(),
+                'aux_logits': aux_logits.detach(),
+                'pred_class': pred_class.detach(),
+            }
+        finally:
+            handle.remove()
+            self.zero_grad(set_to_none=True)
+            if was_training:
+                self.train()
 
     def forward(self, video, clinical):
         b, c, t, h, w = video.shape
